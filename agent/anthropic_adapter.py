@@ -113,7 +113,7 @@ _ANTHROPIC_OUTPUT_LIMITS = {
     "claude-3-opus":       4_096,
     "claude-3-sonnet":     4_096,
     "claude-3-haiku":      4_096,
-    # Third-party Anthropic-compatible providers
+# Third-party Anthropic-compatible providers
     "minimax":            131_072,
     # Qwen models via DashScope Anthropic-compatible endpoint
     # DashScope enforces max_tokens ∈ [1, 65536]
@@ -123,6 +123,20 @@ _ANTHROPIC_OUTPUT_LIMITS = {
 # For any model not in the table, assume the highest current limit.
 # Future Anthropic models are unlikely to have *less* output capacity.
 _ANTHROPIC_DEFAULT_OUTPUT_LIMIT = 128_000
+_DASHSCOPE_QWEN_OUTPUT_LIMIT = 8_192
+
+
+def _dashscope_qwen_output_limit(base_url: str, model: str) -> Optional[int]:
+    """Return DashScope's lower output ceiling for Anthropic Qwen routes."""
+    if not (
+        base_url_host_matches(base_url, "dashscope.aliyuncs.com")
+        or base_url_host_matches(base_url, "dashscope-intl.aliyuncs.com")
+    ):
+        return None
+    model_lower = (model or "").lower()
+    if "qwen" not in model_lower:
+        return None
+    return _DASHSCOPE_QWEN_OUTPUT_LIMIT
 
 
 def _get_anthropic_max_output(model: str) -> int:
@@ -2090,6 +2104,10 @@ def build_anthropic_kwargs(
     effective_max_tokens = _resolve_anthropic_messages_max_tokens(
         max_tokens, model, context_length=context_length
     )
+
+    dashscope_qwen_limit = _dashscope_qwen_output_limit(base_url or "", model)
+    if dashscope_qwen_limit is not None and effective_max_tokens > dashscope_qwen_limit:
+        effective_max_tokens = dashscope_qwen_limit
 
     # Clamp output cap to fit inside the total context window.
     # Only matters for small custom endpoints where context_length < native

@@ -1320,6 +1320,30 @@ class TestBuildAnthropicKwargs:
         )
         assert kwargs["max_tokens"] == 64_000
 
+    def test_dashscope_qwen_clamps_to_8192(self):
+        """DashScope's Anthropic Qwen route rejects max_tokens above 8192."""
+        kwargs = build_anthropic_kwargs(
+            model="qwen3.7-max-preview",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=None,
+            reasoning_config=None,
+            base_url="https://dashscope.aliyuncs.com/apps/anthropic",
+        )
+        assert kwargs["max_tokens"] == 8_192
+
+    def test_dashscope_non_qwen_is_unaffected(self):
+        """Non-Qwen Anthropic models on DashScope should keep their own caps."""
+        kwargs = build_anthropic_kwargs(
+            model="claude-sonnet-4-6",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=None,
+            reasoning_config=None,
+            base_url="https://dashscope.aliyuncs.com/apps/anthropic",
+        )
+        assert kwargs["max_tokens"] == 64_000
+
 
 # ---------------------------------------------------------------------------
 # Model output limit lookup

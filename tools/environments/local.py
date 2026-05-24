@@ -250,9 +250,36 @@ def _find_bash() -> str:
             if os.path.isfile(candidate):
                 return candidate
 
+    # Derive bash from git --exec-path before falling back to PATH.
+    # This avoids picking up WSL's bash.exe (C:\Windows\system32\bash.EXE)
+    # which uses /mnt/c/... paths and cannot handle native Windows paths
+    # like C:/Users/... in shell commands used by ShellFileOperations.
+    try:
+        import subprocess as _sp
+        _git_exec = _sp.check_output(
+            ["git", "--exec-path"], timeout=5, text=True,
+            creationflags=getattr(__import__("subprocess"), "CREATE_NO_WINDOW", 0),
+        ).strip()
+        if _git_exec:
+            # git --exec-path → .../Git/mingw64/libexec/git-core
+            # bash lives at .../Git/bin/bash.exe (3 levels up)
+            _git_root = os.path.dirname(os.path.dirname(os.path.dirname(_git_exec)))
+            for _git_bash_candidate in (
+                os.path.join(_git_root, "bin", "bash.exe"),
+                os.path.join(_git_root, "usr", "bin", "bash.exe"),
+            ):
+                if os.path.isfile(_git_bash_candidate):
+                    return _git_bash_candidate
+    except Exception:
+        pass  # git not available or timeout — fall through
+
     found = shutil.which("bash")
     if found:
-        return found
+        # Skip WSL bash (C:\Windows\system32\bash.EXE) — it uses
+        # /mnt/c/... paths and breaks ShellFileOperations on Windows.
+        if "system32" not in found.lower() and "System32" not in found:
+            return found
+        # WSL bash on PATH — keep searching below
 
     for candidate in (
         os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe"),
