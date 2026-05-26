@@ -388,6 +388,8 @@ class FeishuAdapterSettings:
     ws_reconnect_interval: int = 120
     ws_ping_interval: Optional[int] = None
     ws_ping_timeout: Optional[int] = None
+    ws_watchdog_stale_seconds: int = 3600
+    ws_watchdog_check_interval: int = 60
     admins: frozenset[str] = frozenset()
     default_group_policy: str = ""
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
@@ -1318,28 +1320,67 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     if original_configure is not None:
         setattr(ws_client, "_configure", _configure_with_overrides)
     _apply_runtime_ws_overrides()
+
+    # Reconnect loop with exponential backoff.
+    # The SDK's own auto_reconnect is disabled (see _disable_websocket_auto_reconnect)
+    # so we implement reconnection here with bounded retries and backoff.
+    _MAX_RECONNECT_ATTEMPTS = 10
+    _BACKOFF_SCHEDULE = [30, 60, 120, 300]  # seconds; cap at 5 min
+
+    for attempt in range(_MAX_RECONNECT_ATTEMPTS):
+        try:
+            ws_client.start()
+            # start() returned normally — connection closed gracefully or adapter
+            # shutting down.  Either way, no reconnect needed.
+            break
+        except Exception as exc:
+            if not getattr(adapter, "_running", False):
+                logger.info("[Feishu] Adapter stopped, exiting reconnect loop")
+                break
+
+            if attempt >= _MAX_RECONNECT_ATTEMPTS - 1:
+                logger.error(
+                    "[Feishu] WebSocket client failed after %d attempts, giving up: %s",
+                    attempt + 1, exc, exc_info=True,
+                )
+                # Signal fatal error to gateway so it can queue background reconnect
+                try:
+                    adapter._set_fatal_error(
+                        "feishu_ws_exhausted",
+                        f"WebSocket reconnect exhausted after {_MAX_RECONNECT_ATTEMPTS} attempts",
+                        retryable=True,
+                    )
+                except Exception:
+                    pass
+                break
+
+            delay = _BACKOFF_SCHEDULE[min(attempt, len(_BACKOFF_SCHEDULE) - 1)]
+            logger.warning(
+                "[Feishu] WebSocket client disconnected (attempt %d/%d), "
+                "reconnecting in %ds: %s",
+                attempt + 1, _MAX_RECONNECT_ATTEMPTS, delay, exc,
+            )
+            import time as _time
+            _time.sleep(delay)
+
+    # Cleanup
+    ws_client_module.websockets.connect = original_connect
+    if original_configure is not None:
+        setattr(ws_client, "_configure", original_configure)
+    pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
     try:
-        ws_client.start()
+        loop.stop()
     except Exception:
         pass
-    finally:
-        ws_client_module.websockets.connect = original_connect
-        if original_configure is not None:
-            setattr(ws_client, "_configure", original_configure)
-        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
-        for task in pending:
-            task.cancel()
-        if pending:
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-        try:
-            loop.stop()
-        except Exception:
-            pass
-        try:
-            loop.close()
-        except Exception:
-            pass
-        adapter._ws_thread_loop = None
+    try:
+        loop.close()
+    except Exception:
+        pass
+    adapter._ws_thread_loop = None
 
 
 def check_feishu_requirements() -> bool:
@@ -1467,6 +1508,9 @@ class FeishuAdapter(BasePlatformAdapter):
         # Feishu reaction deletion requires the opaque reaction_id returned
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
+        # WS liveness watchdog: track last inbound activity, force reconnect when stale.
+        self._last_inbound_ts: float = time.time()
+        self._ws_watchdog_task: Optional[asyncio.Task] = None
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1562,6 +1606,18 @@ class FeishuAdapter(BasePlatformAdapter):
             ws_reconnect_interval=_coerce_required_int(extra.get("ws_reconnect_interval"), default=120, min_value=1),
             ws_ping_interval=_coerce_int(extra.get("ws_ping_interval"), default=None, min_value=1),
             ws_ping_timeout=_coerce_int(extra.get("ws_ping_timeout"), default=None, min_value=1),
+            ws_watchdog_stale_seconds=_coerce_required_int(
+                extra.get("ws_watchdog_stale_seconds")
+                or os.getenv("FEISHU_WS_WATCHDOG_STALE_SECONDS"),
+                default=3600,
+                min_value=0,
+            ),
+            ws_watchdog_check_interval=_coerce_required_int(
+                extra.get("ws_watchdog_check_interval")
+                or os.getenv("FEISHU_WS_WATCHDOG_CHECK_INTERVAL"),
+                default=60,
+                min_value=5,
+            ),
             admins=admins,
             default_group_policy=default_group_policy,
             group_rules=group_rules,
@@ -1599,6 +1655,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_reconnect_interval = settings.ws_reconnect_interval
         self._ws_ping_interval = settings.ws_ping_interval
         self._ws_ping_timeout = settings.ws_ping_timeout
+        self._ws_watchdog_stale_seconds = settings.ws_watchdog_stale_seconds
+        self._ws_watchdog_check_interval = settings.ws_watchdog_check_interval
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
 
@@ -1683,6 +1741,7 @@ class FeishuAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Feishu/Lark."""
         self._running = False
+        await self._stop_ws_watchdog()
         await self._cancel_pending_tasks(self._pending_text_batch_tasks)
         await self._cancel_pending_tasks(self._pending_media_batch_tasks)
         self._reset_batch_buffers()
@@ -1745,6 +1804,115 @@ class FeishuAdapter(BasePlatformAdapter):
             setattr(self._ws_client, "_auto_reconnect", False)
         except Exception:
             pass
+        finally:
+            self._ws_client = None
+
+    def _start_ws_watchdog(self) -> None:
+        """Start the WS liveness watchdog (if not already running).
+
+        The lark-oapi SDK relies on `_receive_message_loop` to detect breakage
+        via `recv()` exceptions. When TCP goes half-open silently (NAT idle
+        eviction, network flap) `recv()` blocks forever while the SDK's own
+        `_ping_loop` keeps writing successfully — the SDK never knows the
+        connection is dead. This watchdog catches that case by tracking
+        application-level inbound activity and force-closing the underlying
+        websocket so the SDK's recv loop raises and triggers `_reconnect()`.
+        """
+        if self._ws_watchdog_stale_seconds <= 0:
+            logger.info("[Feishu] WS watchdog disabled (stale_seconds=0)")
+            return
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        existing = self._ws_watchdog_task
+        if existing is not None and not existing.done():
+            return
+        self._last_inbound_ts = time.time()
+        try:
+            self._ws_watchdog_task = loop.create_task(
+                self._ws_liveness_watchdog(),
+                name="feishu-ws-watchdog",
+            )
+        except Exception as exc:
+            logger.warning("[Feishu] WS watchdog failed to start: %s", exc)
+            self._ws_watchdog_task = None
+            return
+        logger.info(
+            "[Feishu] WS watchdog started (stale_seconds=%d, check_interval=%d)",
+            self._ws_watchdog_stale_seconds,
+            self._ws_watchdog_check_interval,
+        )
+
+    async def _stop_ws_watchdog(self) -> None:
+        task = self._ws_watchdog_task
+        self._ws_watchdog_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    async def _ws_liveness_watchdog(self) -> None:
+        """Periodic liveness check; force-close stale WS so SDK reconnects."""
+        check_interval = max(5, int(self._ws_watchdog_check_interval))
+        stale_seconds = int(self._ws_watchdog_stale_seconds)
+        while True:
+            try:
+                await asyncio.sleep(check_interval)
+            except asyncio.CancelledError:
+                return
+            try:
+                elapsed = time.time() - self._last_inbound_ts
+                if elapsed < stale_seconds:
+                    continue
+                ws_client = self._ws_client
+                if ws_client is None:
+                    continue
+                # Reset the timer before forcing close to avoid double-firing
+                # while reconnection is in flight.
+                self._last_inbound_ts = time.time()
+                logger.warning(
+                    "[Feishu] WS watchdog: no inbound activity for %.0fs "
+                    "(threshold=%ds); forcing reconnect.",
+                    elapsed,
+                    stale_seconds,
+                )
+                await self._force_ws_reconnect()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("[Feishu] WS watchdog iteration failed")
+
+    async def _force_ws_reconnect(self) -> None:
+        """Close the underlying websocket so SDK's recv loop triggers reconnect."""
+        ws_client = self._ws_client
+        if ws_client is None:
+            return
+        thread_loop = self._ws_thread_loop
+        conn = getattr(ws_client, "_conn", None)
+        if conn is None or thread_loop is None or thread_loop.is_closed():
+            logger.warning(
+                "[Feishu] WS watchdog: no live connection to close "
+                "(conn=%s, thread_loop=%s)",
+                conn is not None,
+                thread_loop is not None,
+            )
+            return
+
+        async def _close() -> None:
+            try:
+                await conn.close(code=1011, reason="watchdog-stale")
+            except Exception as exc:
+                logger.warning("[Feishu] WS watchdog close failed: %s", exc)
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_close(), thread_loop)
+            await asyncio.wrap_future(fut)
+            logger.info("[Feishu] WS watchdog: forced socket close; SDK will reconnect")
+        except Exception as exc:
+            logger.warning("[Feishu] WS watchdog: failed to dispatch close: %s", exc)
         finally:
             self._ws_client = None
 
@@ -2270,6 +2438,8 @@ class FeishuAdapter(BasePlatformAdapter):
         during startup/restart or network-flap reconnect), the event is queued
         for replay instead of dropped.
         """
+        # Liveness signal for the WS watchdog — any inbound activity counts.
+        self._last_inbound_ts = time.time()
         loop = self._loop
         if not self._loop_accepts_callbacks(loop):
             start_drainer = self._enqueue_pending_inbound_event(data)
@@ -4496,6 +4666,20 @@ class FeishuAdapter(BasePlatformAdapter):
             self._ws_client,
             self,
         )
+
+        def _on_ws_thread_done(fut: "asyncio.Future[None]") -> None:
+            # Guard against normal shutdown or an error already being set.
+            if not self._running or self.has_fatal_error:
+                return
+            exc = fut.exception() if not fut.cancelled() else None
+            detail = repr(exc) if exc else "thread exited without exception"
+            msg = f"Feishu websocket thread exited unexpectedly: {detail}"
+            logger.error("[Feishu] %s — triggering in-process reconnect", msg)
+            self._set_fatal_error("feishu_ws_exited", msg, retryable=True)
+            loop.create_task(self._notify_fatal_error())
+
+        self._ws_future.add_done_callback(_on_ws_thread_done)
+        self._start_ws_watchdog()
 
     async def _connect_webhook(self) -> None:
         if not FEISHU_WEBHOOK_AVAILABLE:
