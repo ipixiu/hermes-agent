@@ -147,6 +147,23 @@ def test_goal_resume_reactivates(server, session):
     assert GoalManager(session_key).state.status == "active"
 
 
+def test_goal_resume_shows_status_line(server, session):
+    sid, session_key, _ = session
+    _call(server, "command.dispatch", name="goal", arg="write a story", session_id=sid)
+    _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
+    r = _call(server, "command.dispatch", name="goal", arg="resume", session_id=sid)
+    assert r["result"]["type"] == "exec"
+    assert "Goal resumed" in r["result"]["output"]
+    assert "Goal (active" in r["result"]["output"]
+    assert "0/20 turns" in r["result"]["output"]
+    assert r["result"]["output"].index("Goal resumed") < r["result"]["output"].index("Goal (active")
+    assert r["result"]["output"].index("Goal (active") < r["result"]["output"].index("Send any message")
+
+    from hermes_cli.goals import GoalManager
+
+    assert GoalManager(session_key).state.status == "active"
+
+
 def test_goal_clear_removes_active_goal(server, session):
     sid, session_key, _ = session
     _call(server, "command.dispatch", name="goal", arg="write a story", session_id=sid)

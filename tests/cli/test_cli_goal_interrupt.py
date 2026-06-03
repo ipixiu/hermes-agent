@@ -218,3 +218,18 @@ class TestInterruptFlagLifecycle:
             "runs — otherwise a prior turn's interrupt state leaks into the "
             "next turn's goal hook decision."
         )
+
+    def test_goal_resume_prints_status_line(self, hermes_home, capsys):
+        """/goal resume should show the refreshed active status line."""
+        sid = f"sid-print-{uuid.uuid4().hex}"
+        cli, mgr = _make_cli_with_goal(sid)
+        mgr.pause(reason="user-paused")
+
+        cli._handle_goal_command("/goal resume")
+        out = capsys.readouterr().out
+
+        assert "Goal resumed" in out
+        assert "Goal (active" in out
+        assert "0/5 turns" in out
+        assert out.index("Goal resumed") < out.index("Goal (active")
+        assert out.index("Goal (active") < out.index("Send any message")

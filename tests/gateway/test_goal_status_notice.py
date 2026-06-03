@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,20 @@ from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 from hermes_cli.goals import CONTINUATION_PROMPT_TEMPLATE
+
+
+@pytest.fixture()
+def hermes_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from hermes_cli import goals
+
+    goals._DB_CACHE.clear()
+    yield home
+    goals._DB_CACHE.clear()
 
 
 class FakeAdapter:
@@ -145,3 +160,40 @@ def test_clear_goal_pending_continuations_removes_slot_and_overflow_only():
     assert removed == 2
     assert adapter._pending_messages.get(session_key) is None
     assert runner._queued_events[session_key] == [normal_event]
+
+
+@pytest.mark.asyncio
+async def test_goal_resume_returns_status_line_after_pause(hermes_home):
+    """/goal resume should surface the refreshed active status line."""
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.adapters = {}
+    runner.config = SimpleNamespace(goals={"max_turns": 5})
+    runner.session_store = SimpleNamespace()
+    runner.session_store.get_or_create_session = lambda source: SimpleNamespace(
+        session_id="goal-resume-sid"
+    )
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="parent-channel",
+        thread_id="thread-123",
+    )
+    event = MessageEvent(
+        text="/goal resume",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager("goal-resume-sid", default_max_turns=5)
+    mgr.set("finish the task")
+    mgr.pause(reason="user-paused")
+
+    result = await runner._handle_goal_command(event)
+
+    assert "Goal resumed" in result
+    assert "Goal (active" in result
+    assert "0/5 turns" in result
+    assert result.index("Goal resumed") < result.index("Goal (active")
+    assert result.index("Goal (active") < result.index("Send any message")

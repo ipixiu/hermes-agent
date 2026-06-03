@@ -226,6 +226,21 @@ class TestGoalManager:
         mgr.resume()
         assert mgr.state.status == "active"
         assert mgr.is_active()
+        assert mgr.state.turns_used == 0
+
+    def test_resume_resets_turn_budget_counter(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="test-sid-4b", default_max_turns=5)
+        mgr.set("goal text")
+        mgr.state.turns_used = 4
+        mgr.pause(reason="user-paused")
+
+        resumed = mgr.resume()
+
+        assert resumed is not None
+        assert resumed.status == "active"
+        assert resumed.turns_used == 0
 
     def test_clear(self, hermes_home):
         from hermes_cli.goals import GoalManager

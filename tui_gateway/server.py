@@ -5969,6 +5969,7 @@ def _(rid, params: dict) -> dict:
                     "type": "exec",
                     "output": (
                         f"▶ Goal resumed: {state.goal}\n"
+                        f"{mgr.status_line()}\n"
                         "Send any message to continue, or wait — I'll take the next step on the next turn."
                     ),
                 },

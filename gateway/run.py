@@ -11512,7 +11512,11 @@ class GatewayRunner:
             state = mgr.resume()
             if state is None:
                 return t("gateway.goal.no_resume")
-            return t("gateway.goal.resumed", goal=state.goal)
+            resumed = t("gateway.goal.resumed", goal=state.goal)
+            head, sep, tail = resumed.partition("\n")
+            if sep:
+                return f"{head}\n{mgr.status_line()}\n{tail}"
+            return f"{resumed}\n{mgr.status_line()}"
 
         if lower in {"clear", "stop", "done"}:
             had = mgr.has_goal()
