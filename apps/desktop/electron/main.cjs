@@ -4807,7 +4807,7 @@ function createWindow() {
   }
 
   mainWindow.webContents.once('did-finish-load', () => {
-    mainWindow.webContents.setZoomFactor(1.5)
+    restorePersistedZoomLevel(mainWindow)
     broadcastBootProgress()
     sendWindowStateChanged()
     startHermes().catch(error => rememberLog(error.stack || error.message))
