@@ -14,6 +14,7 @@ import {
   upsertToolPart
 } from '@/lib/chat-messages'
 import { coerceGatewayText, coerceThinkingText, normalizePersonalityValue } from '@/lib/chat-runtime'
+import { gatewayEventRequiresSessionId } from '@/lib/gateway-events'
 import { triggerHaptic } from '@/lib/haptics'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { setClarifyRequest } from '@/store/clarify'
@@ -410,6 +411,10 @@ export function useMessageStream({
       phase: 'running' | 'complete',
       sourceEventType?: string
     ) => {
+      // Text deltas flush on a timer but tool events apply now; flush first so
+      // a tool part can't jump ahead of the text that preceded it.
+      flushQueuedDeltas(sessionId)
+
       if (!nativeSubagentSessionsRef.current.has(sessionId)) {
         for (const subagentPayload of delegateTaskPayloads(payload, phase, sourceEventType)) {
           upsertSubagent(
@@ -428,7 +433,7 @@ export function useMessageStream({
         { pending: m => phase !== 'complete' || (m.pending ?? false) }
       )
     },
-    [mutateStream]
+    [flushQueuedDeltas, mutateStream]
   )
 
   const completeAssistantMessage = useCallback(
@@ -447,7 +452,8 @@ export function useMessageStream({
             busy: false,
             needsInput: false,
             pendingBranchGroup: null,
-            streamId: null
+            streamId: null,
+            turnStartedAt: null
           }
         }
 
@@ -537,7 +543,8 @@ export function useMessageStream({
           pendingBranchGroup: null,
           awaitingResponse: false,
           busy: false,
-          needsInput: false
+          needsInput: false,
+          turnStartedAt: null
         }
       })
 
@@ -595,7 +602,8 @@ export function useMessageStream({
           sawAssistantPayload: true,
           awaitingResponse: false,
           busy: false,
-          needsInput: false
+          needsInput: false,
+          turnStartedAt: null
         }
       })
     },
@@ -606,6 +614,9 @@ export function useMessageStream({
     (event: RpcEvent) => {
       const payload = event.payload as GatewayEventPayload | undefined
       const explicitSid = event.session_id || ''
+      if (!explicitSid && gatewayEventRequiresSessionId(event.type)) {
+        return
+      }
       const sessionId = explicitSid || activeSessionIdRef.current
       const isActiveEvent = !!sessionId && sessionId === activeSessionIdRef.current
 
@@ -679,7 +690,8 @@ export function useMessageStream({
               if (busy) {
                 return {
                   ...state,
-                  busy
+                  busy,
+                  turnStartedAt: state.turnStartedAt ?? Date.now()
                 }
               }
 
@@ -692,7 +704,8 @@ export function useMessageStream({
                 awaitingResponse: false,
                 busy,
                 pendingBranchGroup: null,
-                streamId: null
+                streamId: null,
+                turnStartedAt: null
               }
             })
           }
@@ -731,7 +744,8 @@ export function useMessageStream({
           busy: true,
           awaitingResponse: true,
           sawAssistantPayload: false,
-          interrupted: false
+          interrupted: false,
+          turnStartedAt: Date.now()
         }))
 
         if (isActiveEvent) {
