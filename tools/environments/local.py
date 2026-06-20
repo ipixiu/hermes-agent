@@ -269,7 +269,11 @@ def _find_bash() -> str:
 
     found = shutil.which("bash")
     if found:
-        return found
+        # Skip WSL bash (C:\Windows\system32\bash.EXE) — it uses
+        # /mnt/c/... paths and breaks ShellFileOperations on Windows.
+        if "system32" not in found.lower():
+            return found
+        # WSL bash on PATH — keep searching below
 
     for candidate in (
         os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe"),

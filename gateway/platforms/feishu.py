@@ -390,6 +390,8 @@ class FeishuAdapterSettings:
     ws_reconnect_interval: int = 120
     ws_ping_interval: Optional[int] = None
     ws_ping_timeout: Optional[int] = None
+    ws_watchdog_stale_seconds: int = 3600
+    ws_watchdog_check_interval: int = 60
     admins: frozenset[str] = frozenset()
     default_group_policy: str = ""
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
@@ -1320,28 +1322,47 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     if original_configure is not None:
         setattr(ws_client, "_configure", _configure_with_overrides)
     _apply_runtime_ws_overrides()
+    
+    # Reconnect loop with exponential backoff
+    _MAX_RECONNECT_ATTEMPTS = 10
+    _BACKOFF_SCHEDULE = [30, 60, 120, 300]  # seconds
+    
+    for attempt in range(_MAX_RECONNECT_ATTEMPTS):
+        try:
+            ws_client.start()
+            break  # Normal exit, no reconnect needed
+        except Exception as exc:
+            if not getattr(adapter, '_running', False):
+                logger.info("[Feishu] Adapter stopped, not reconnecting")
+                break
+            
+            if attempt >= _MAX_RECONNECT_ATTEMPTS - 1:
+                logger.error(f"[Feishu] WS reconnect exhausted after {_MAX_RECONNECT_ATTEMPTS} attempts: {exc}")
+                break
+            
+            delay = _BACKOFF_SCHEDULE[min(attempt, len(_BACKOFF_SCHEDULE) - 1)]
+            logger.warning(f"[Feishu] WS disconnected, reconnecting in {delay}s (attempt {attempt + 1}/{_MAX_RECONNECT_ATTEMPTS}): {exc}")
+            import time as _time
+            _time.sleep(delay)
+    
+    # Cleanup
+    ws_client_module.websockets.connect = original_connect
+    if original_configure is not None:
+        setattr(ws_client, "_configure", original_configure)
+    pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
     try:
-        ws_client.start()
+        loop.stop()
     except Exception:
         pass
-    finally:
-        ws_client_module.websockets.connect = original_connect
-        if original_configure is not None:
-            setattr(ws_client, "_configure", original_configure)
-        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
-        for task in pending:
-            task.cancel()
-        if pending:
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-        try:
-            loop.stop()
-        except Exception:
-            pass
-        try:
-            loop.close()
-        except Exception:
-            pass
-        adapter._ws_thread_loop = None
+    try:
+        loop.close()
+    except Exception:
+        pass
+    adapter._ws_thread_loop = None
 
 
 def check_feishu_requirements() -> bool:
