@@ -87,6 +87,11 @@ def build_gateway_parser(
     )
     add_accept_hooks_flag(gateway_run)
     add_accept_hooks_flag(gateway_parser)
+    gateway_parser.add_argument(
+        "--hermes-home",
+        dest="hermes_home",
+        help=argparse.SUPPRESS,
+    )
 
     # gateway start
     gateway_start = gateway_subparsers.add_parser(

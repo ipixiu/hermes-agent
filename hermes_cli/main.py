@@ -343,6 +343,9 @@ def _apply_profile_override() -> None:
     profile_name = None
     consume = 0
     profile_index = None
+    hermes_home_value = None
+    hermes_home_index = None
+    hermes_home_consume = 0
 
     def _inside_mcp_add_args(index: int) -> bool:
         """True once argv reaches `hermes mcp add ... --args <command argv>`.
@@ -407,6 +410,18 @@ def _apply_profile_override() -> None:
         arg = argv[i]
         if arg == "--":
             break
+        if arg == "--hermes-home" and i + 1 < len(argv):
+            hermes_home_value = argv[i + 1]
+            hermes_home_consume = 2
+            hermes_home_index = i
+            i += 2
+            continue
+        if arg.startswith("--hermes-home="):
+            hermes_home_value = arg.split("=", 1)[1]
+            hermes_home_consume = 1
+            hermes_home_index = i
+            i += 1
+            continue
         if arg == "--args" and _inside_mcp_add_args(i):
             break
         if arg in {"--profile", "-p"} and i + 1 < len(argv):
@@ -430,6 +445,13 @@ def _apply_profile_override() -> None:
             i += 2
         else:
             i += 1
+
+    if hermes_home_value:
+        os.environ["HERMES_HOME"] = hermes_home_value
+        if hermes_home_consume > 0 and hermes_home_index is not None:
+            start = hermes_home_index + 1
+            sys.argv = sys.argv[:start] + sys.argv[start + hermes_home_consume :]
+            argv = sys.argv[1:]
 
     # 1b. Reject values that can't be valid profile names (e.g. pytest's
     # "-p no:xdist" would be misread as profile "no:xdist" otherwise).
