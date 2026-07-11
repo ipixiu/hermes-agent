@@ -28,11 +28,13 @@ Design notes
 from __future__ import annotations
 
 import ctypes
+from functools import lru_cache
 import locale
 import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -60,6 +62,10 @@ _TASK_DESCRIPTION = "Hermes Agent Gateway - Messaging Platform Integration"
 _TASK_LOGON_DELAY = "PT30S"
 _TASK_RESTART_INTERVAL = "PT1M"
 _TASK_RESTART_COUNT = 999
+_TASK_RESTART_DELAY_MS = 60_000
+_LOCAL_PROXY_HOST = "127.0.0.1"
+_LOCAL_PROXY_PORT = 7890
+_LOCAL_PROXY_ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
 
 
 def _schtasks_encoding() -> str:
@@ -108,6 +114,33 @@ def _preserve_hermes_home_path(path: str | Path) -> str:
     except Exception:
         pass
     return str(candidate)
+
+
+def _local_proxy_url() -> str:
+    return f"http://{_LOCAL_PROXY_HOST}:{_LOCAL_PROXY_PORT}"
+
+
+def _should_use_local_http_proxy(timeout: float = 0.25) -> bool:
+    """Return True when the local Clash-style HTTP proxy is actually listening."""
+    try:
+        with socket.create_connection((_LOCAL_PROXY_HOST, _LOCAL_PROXY_PORT), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _local_proxy_env_overlay() -> dict[str, str]:
+    """Expose proxy vars only when the local HTTP proxy is alive.
+
+    The empty-string defaults intentionally override inherited stale proxy vars
+    so `hermes gateway start` still works after Clash is closed.
+    """
+    overlay = {key: "" for key in _LOCAL_PROXY_ENV_KEYS}
+    if _should_use_local_http_proxy():
+        proxy_url = _local_proxy_url()
+        for key in _LOCAL_PROXY_ENV_KEYS:
+            overlay[key] = proxy_url
+    return overlay
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +246,11 @@ def _launch_elevated_gateway_command(command: str, extra_args: list[str] | None 
     decisions are already collected in the parent shell before this point.
     """
     _assert_windows()
-    args = ["-m", "hermes_cli.main", *_current_profile_cli_args(), "gateway", command]
+    args = ["-m", "hermes_cli.main"]
+    hermes_home = os.environ.get("HERMES_HOME", "").strip()
+    if hermes_home:
+        args.extend(["--hermes-home", hermes_home])
+    args.extend([*_current_profile_cli_args(), "gateway", command])
     if extra_args:
         args.extend(extra_args)
     params = subprocess.list2cmdline(args)
@@ -410,6 +447,18 @@ def _build_gateway_cmd_script(
         *[_preserve_hermes_home_path(entry) for entry in extra_pythonpath],
     ]
     lines.append(f'set "PYTHONPATH={";".join([*pythonpath_entries, "%PYTHONPATH%"])}"')
+    for key in _LOCAL_PROXY_ENV_KEYS:
+        lines.append(f'set "{key}="')
+    lines.append(
+        "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+        f"\"if (Get-NetTCPConnection -LocalAddress {_LOCAL_PROXY_HOST} -LocalPort {_LOCAL_PROXY_PORT} "
+        " -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1) { exit 0 } else { exit 1 }\" >nul 2>nul"
+    )
+    lines.append("if not errorlevel 1 (")
+    proxy_url = _local_proxy_url()
+    for key in _LOCAL_PROXY_ENV_KEYS:
+        lines.append(f'set "{key}={proxy_url}"')
+    lines.append(")")
 
     prog_args = [pythonw_path, "-m", "hermes_cli.main"]
     if profile_arg:
@@ -477,13 +526,17 @@ def _build_gateway_vbs_script(
     lines = [
         f"' {_TASK_DESCRIPTION}",
         "Option Explicit",
-        "Dim sh, env, existing_pp",
+        "Dim sh, env, existing_pp, gateway_exit_code",
         'Set sh = CreateObject("WScript.Shell")',
         'Set env = sh.Environment("PROCESS")',
         f"env.Item({_quote_vbs_string('HERMES_HOME')}) = {_quote_vbs_string(hermes_home)}",
         f"env.Item({_quote_vbs_string('PYTHONIOENCODING')}) = {_quote_vbs_string('utf-8')}",
         f"env.Item({_quote_vbs_string('HERMES_GATEWAY_DETACHED')}) = {_quote_vbs_string('1')}",
         f"env.Item({_quote_vbs_string('VIRTUAL_ENV')}) = {_quote_vbs_string(_preserve_hermes_home_path(venv_dir))}",
+        *[
+            f"env.Item({_quote_vbs_string(key)}) = {_quote_vbs_string('')}"
+            for key in _LOCAL_PROXY_ENV_KEYS
+        ],
         # Mirror the cmd wrapper's ``PYTHONPATH=<static>;%PYTHONPATH%``: chain onto
         # whatever PYTHONPATH the task environment already carries, at runtime.
         f"existing_pp = env.Item({_quote_vbs_string('PYTHONPATH')})",
@@ -492,10 +545,29 @@ def _build_gateway_vbs_script(
         "Else",
         f"  env.Item({_quote_vbs_string('PYTHONPATH')}) = {_quote_vbs_string(static_pythonpath)}",
         "End If",
+        "If sh.Run("
+        + _quote_vbs_string(
+            "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+            f"\"if (Get-NetTCPConnection -LocalAddress {_LOCAL_PROXY_HOST} -LocalPort {_LOCAL_PROXY_PORT} "
+            " -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1) { exit 0 } else { exit 1 }\""
+        )
+        + ", 0, True) = 0 Then",
+        *[
+            f"  env.Item({_quote_vbs_string(key)}) = {_quote_vbs_string(_local_proxy_url())}"
+            for key in _LOCAL_PROXY_ENV_KEYS
+        ],
+        "End If",
         f"sh.CurrentDirectory = {_quote_vbs_string(working_dir)}",
-        # Window style 0 = hidden; bWaitOnReturn False = detached/async. pythonw is
-        # GUI-subsystem so no console is ever created for the gateway either.
-        f"sh.Run {_quote_vbs_string(command_line)}, 0, False",
+        # Window style 0 keeps the gateway hidden. Waiting lets this launcher
+        # distinguish a clean stop from a crash and supervise the gateway even
+        # on Task Scheduler engines that ignore RestartOnFailure.
+        "Do",
+        f"  gateway_exit_code = sh.Run({_quote_vbs_string(command_line)}, 0, True)",
+        "  If gateway_exit_code = 0 Then",
+        "    WScript.Quit 0",
+        "  End If",
+        f"  WScript.Sleep {_TASK_RESTART_DELAY_MS}",
+        "Loop",
     ]
     return "\r\n".join(lines) + "\r\n"
 
@@ -604,6 +676,7 @@ def _build_scheduled_task_xml(task_name: str, launcher_path: Path, user: str | N
     <AllowHardTerminate>true</AllowHardTerminate>
     <StartWhenAvailable>true</StartWhenAvailable>
     <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <UseUnifiedSchedulingEngine>false</UseUnifiedSchedulingEngine>
     <IdleSettings>
       <StopOnIdleEnd>false</StopOnIdleEnd>
       <RestartOnIdle>false</RestartOnIdle>
@@ -731,6 +804,27 @@ def _read_pyvenv_cfg(venv_dir: Path) -> dict[str, str]:
     return parsed
 
 
+@lru_cache(maxsize=8)
+def _pythonw_asyncio_usable(executable: str) -> bool:
+    """Return whether pythonw can create and close a Windows asyncio loop."""
+    if sys.platform != "win32":
+        return True
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    probe = "import asyncio; asyncio.run(asyncio.sleep(0))"
+    try:
+        completed = subprocess.run(
+            [executable, "-c", probe],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2.0,
+            check=False,
+            creationflags=creationflags,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
 def _resolve_detached_python(python_exe: str) -> tuple[str, Path, list[str]]:
     """Return (windowed_python, venv_dir, extra_pythonpath) for detached runs.
 
@@ -748,9 +842,12 @@ def _resolve_detached_python(python_exe: str) -> tuple[str, Path, list[str]]:
     cfg = _read_pyvenv_cfg(venv_dir)
     home = cfg.get("home", "")
     if "uv" in cfg and home:
+        base_python = Path(home) / "python.exe"
         base_pythonw = Path(home) / "pythonw.exe"
         site_packages = venv_dir / "Lib" / "site-packages"
         if base_pythonw.exists() and site_packages.exists():
+            if base_python.exists() and not _pythonw_asyncio_usable(str(base_pythonw)):
+                return (str(base_python), venv_dir, [str(site_packages)])
             return (str(base_pythonw), venv_dir, [str(site_packages)])
 
     return (windowed, venv_dir, [])
@@ -800,6 +897,7 @@ def _build_gateway_argv() -> tuple[list[str], str, dict[str, str]]:
         "HERMES_GATEWAY_DETACHED": "1",
         "VIRTUAL_ENV": _preserve_hermes_home_path(venv_dir),
     }
+    env_overlay.update(_local_proxy_env_overlay())
     _prepend_pythonpath(
         env_overlay,
         [project_root, *[_preserve_hermes_home_path(entry) for entry in extra_pythonpath]]

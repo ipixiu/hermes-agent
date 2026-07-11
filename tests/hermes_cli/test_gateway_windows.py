@@ -112,6 +112,104 @@ def test_build_gateway_argv_uses_base_pythonw_for_uv_venv_launcher(monkeypatch, 
     assert str(site_packages) in env_overlay["PYTHONPATH"].split(gateway_windows.os.pathsep)
 
 
+def test_resolve_detached_python_falls_back_when_pythonw_asyncio_is_unusable(monkeypatch, tmp_path):
+    venv_dir = tmp_path / "venv"
+    scripts = venv_dir / "Scripts"
+    site_packages = venv_dir / "Lib" / "site-packages"
+    base = tmp_path / "base"
+    scripts.mkdir(parents=True)
+    site_packages.mkdir(parents=True)
+    base.mkdir()
+
+    venv_python = scripts / "python.exe"
+    base_python = base / "python.exe"
+    base_pythonw = base / "pythonw.exe"
+    for executable in (venv_python, base_python, base_pythonw):
+        executable.write_text("", encoding="utf-8")
+    (venv_dir / "pyvenv.cfg").write_text(
+        f"home = {base}\nuv = 0.11.14\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gateway_windows, "_pythonw_asyncio_usable", lambda executable: False)
+
+    resolved, resolved_venv, extra_pythonpath = gateway_windows._resolve_detached_python(str(venv_python))
+
+    assert resolved == str(base_python)
+    assert resolved_venv == venv_dir
+    assert extra_pythonpath == [str(site_packages)]
+
+def test_build_gateway_argv_enables_local_proxy_when_listener_exists(monkeypatch, tmp_path):
+    project = tmp_path / "project"
+    scripts = project / "venv" / "Scripts"
+    site_packages = project / "venv" / "Lib" / "site-packages"
+    hermes_home = tmp_path / "hermes-home"
+    base = tmp_path / "uv" / "python" / "cpython-3.11-windows-x86_64-none"
+    scripts.mkdir(parents=True)
+    site_packages.mkdir(parents=True)
+    hermes_home.mkdir()
+    base.mkdir(parents=True)
+
+    venv_python = scripts / "python.exe"
+    venv_pythonw = scripts / "pythonw.exe"
+    base_pythonw = base / "pythonw.exe"
+    for exe in (venv_python, venv_pythonw, base_pythonw):
+        exe.write_text("", encoding="utf-8")
+    (project / "venv" / "pyvenv.cfg").write_text(
+        f"home = {base}\nimplementation = CPython\nuv = 0.11.14\nversion_info = 3.11.15\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(gateway_windows.sys, "platform", "win32")
+    monkeypatch.setattr(gateway, "PROJECT_ROOT", project)
+    monkeypatch.setattr(gateway, "get_python_path", lambda: str(venv_python))
+    monkeypatch.setattr(gateway, "_profile_arg", lambda hermes_home: "")
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: str(hermes_home))
+    monkeypatch.setattr(gateway_windows, "_should_use_local_http_proxy", lambda timeout=0.25: True)
+
+    _argv, _cwd, env_overlay = gateway_windows._build_gateway_argv()
+
+    assert env_overlay["HTTP_PROXY"] == "http://127.0.0.1:7890"
+    assert env_overlay["HTTPS_PROXY"] == "http://127.0.0.1:7890"
+    assert env_overlay["http_proxy"] == "http://127.0.0.1:7890"
+    assert env_overlay["https_proxy"] == "http://127.0.0.1:7890"
+
+
+def test_build_gateway_argv_clears_stale_local_proxy_when_listener_missing(monkeypatch, tmp_path):
+    project = tmp_path / "project"
+    scripts = project / "venv" / "Scripts"
+    site_packages = project / "venv" / "Lib" / "site-packages"
+    hermes_home = tmp_path / "hermes-home"
+    base = tmp_path / "uv" / "python" / "cpython-3.11-windows-x86_64-none"
+    scripts.mkdir(parents=True)
+    site_packages.mkdir(parents=True)
+    hermes_home.mkdir()
+    base.mkdir(parents=True)
+
+    venv_python = scripts / "python.exe"
+    venv_pythonw = scripts / "pythonw.exe"
+    base_pythonw = base / "pythonw.exe"
+    for exe in (venv_python, venv_pythonw, base_pythonw):
+        exe.write_text("", encoding="utf-8")
+    (project / "venv" / "pyvenv.cfg").write_text(
+        f"home = {base}\nimplementation = CPython\nuv = 0.11.14\nversion_info = 3.11.15\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(gateway_windows.sys, "platform", "win32")
+    monkeypatch.setattr(gateway, "PROJECT_ROOT", project)
+    monkeypatch.setattr(gateway, "get_python_path", lambda: str(venv_python))
+    monkeypatch.setattr(gateway, "_profile_arg", lambda hermes_home: "")
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: str(hermes_home))
+    monkeypatch.setattr(gateway_windows, "_should_use_local_http_proxy", lambda timeout=0.25: False)
+
+    _argv, _cwd, env_overlay = gateway_windows._build_gateway_argv()
+
+    assert env_overlay["HTTP_PROXY"] == ""
+    assert env_overlay["HTTPS_PROXY"] == ""
+    assert env_overlay["http_proxy"] == ""
+    assert env_overlay["https_proxy"] == ""
+
+
 class TestStableWindowsGatewayWorkingDir:
     def test_stable_gateway_working_dir_uses_hermes_home(self, tmp_path, monkeypatch):
         home = tmp_path / ".hermes"
@@ -208,6 +306,8 @@ def test_gateway_cmd_script_uses_pythonw_without_replace_or_start_churn(monkeypa
     assert "--replace" not in content
     assert "start \"\"" not in content
     assert "exit /b 0" in content
+    assert 'set "HTTP_PROXY="' in content
+    assert "Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 7890" in content
 
 
 def test_gateway_cmd_script_uses_uv_safe_base_pythonw(monkeypatch, tmp_path):
@@ -308,6 +408,7 @@ def test_install_scheduled_task_recreates_instead_of_change(monkeypatch, tmp_pat
     assert "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>" in xml_seen["text"]
     assert "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>" in xml_seen["text"]
     assert "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>" in xml_seen["text"]
+    assert "<UseUnifiedSchedulingEngine>false</UseUnifiedSchedulingEngine>" in xml_seen["text"]
     assert "<RestartOnFailure>" in xml_seen["text"]
     assert "<Count>999</Count>" in xml_seen["text"]
     # Scheduled Task launches the console-less .vbs via wscript.exe, never cmd.exe
@@ -318,9 +419,8 @@ def test_install_scheduled_task_recreates_instead_of_change(monkeypatch, tmp_pat
     assert "cmd.exe" not in xml_seen["text"]
 
 
-def test_gateway_vbs_script_is_console_less(monkeypatch):
-    """The .vbs launcher must avoid cmd.exe entirely and Run pythonw hidden
-    (issue #45599 fix A: no console -> no logon CTRL_CLOSE_EVENT / 0xC000013A)."""
+def test_gateway_vbs_script_is_console_less_and_supervised(monkeypatch):
+    """The task launcher must stay alive and return the gateway exit code."""
     monkeypatch.setattr(
         gateway_windows,
         "_resolve_detached_python",
@@ -337,11 +437,49 @@ def test_gateway_vbs_script_is_console_less(monkeypatch):
     assert "pythonw.exe" in content
     assert "hermes_cli.main" in content
     assert "gateway run" in content
-    assert ", 0, False" in content  # hidden window, detached/async
+    assert "gateway_exit_code = sh.Run" in content
+    assert ", 0, True" in content
+    assert "Do" in content
+    assert "If gateway_exit_code = 0 Then" in content
+    assert "WScript.Quit 0" in content
+    assert "WScript.Sleep 60000" in content
+    assert "Loop" in content
+    assert ", 0, False" not in content
     for var in ("HERMES_HOME", "PYTHONIOENCODING", "HERMES_GATEWAY_DETACHED", "VIRTUAL_ENV", "PYTHONPATH"):
         assert var in content
+    assert 'env.Item("HTTP_PROXY") = ""' in content
+    assert "Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 7890" in content
     assert "--profile" in content and "work" in content
     assert content.endswith("\r\n")
+
+
+def test_launch_elevated_gateway_command_preserves_current_hermes_home(monkeypatch):
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "_current_profile_cli_args", lambda: [])
+    monkeypatch.setattr(gateway_windows, "_derive_venv_pythonw", lambda exe: exe)
+    monkeypatch.setattr(gateway_windows.sys, "executable", r"C:\Hermes\venv\Scripts\pythonw.exe")
+    monkeypatch.setattr(gateway_windows.Path, "resolve", lambda self: Path(r"D:\test\github\hermes-agent"))
+    monkeypatch.setenv("HERMES_HOME", r"C:\Users\alex\AppData\Local\hermes")
+
+    seen = {}
+
+    class _Shell32:
+        @staticmethod
+        def ShellExecuteW(_hwnd, _verb, file, params, cwd, show):
+            seen["file"] = file
+            seen["params"] = params
+            seen["cwd"] = cwd
+            seen["show"] = show
+            return 33
+
+    class _Windll:
+        shell32 = _Shell32()
+
+    monkeypatch.setattr(gateway_windows.ctypes, "windll", _Windll(), raising=False)
+
+    assert gateway_windows._launch_elevated_gateway_command("install", ["--start-now"]) is True
+    assert "--hermes-home" in seen["params"]
+    assert r"C:\Users\alex\AppData\Local\hermes" in seen["params"]
 
 
 def test_gateway_vbs_script_quotes_spaced_paths(monkeypatch):
